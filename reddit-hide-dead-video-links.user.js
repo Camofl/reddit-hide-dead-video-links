@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Reddit - Hide Dead Video Links
 // @namespace    Camofl.RedditHideDeadVideoLinks
-// @version      1.0.1
+// @version      1.0.2
 // @description  Hide Reddit posts linking to discontinued video hosts or confirmed missing media, with a toggle to reveal filtered posts.
 // @author       Camofl
 // @license      MIT
@@ -190,6 +190,12 @@
 
     function getMissingMediaReason(response, url) {
         if (!response) return null;
+        const finalURL = parseWebURL(response.finalUrl);
+        if (hostnameMatches(url.hostname, "imgur.com") &&
+            finalURL && hostnameMatches(finalURL.hostname, "imgur.com") &&
+            /^\/removed\.(?:png|gif|jpe?g)\/?$/i.test(finalURL.pathname)) {
+            return "Imgur redirected to its removed-media placeholder";
+        }
         if ([404, 410].includes(response.status)) return `HTTP ${response.status}`;
         if (response.status !== 200) return null;
         const responseHTML = response.responseText || "";
