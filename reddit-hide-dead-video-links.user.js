@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Reddit - Hide Dead Video Links
 // @namespace    Camofl.RedditHideDeadVideoLinks
-// @version      1.0.3
-// @description  Hide Reddit posts linking to discontinued video hosts or confirmed missing media, with a toggle to reveal filtered posts.
+// @version      1.0.4
+// @description  Hide Reddit posts linking to discontinued hosts or unavailable media, including selected soft 404s.
 // @author       Camofl
 // @license      MIT
 // @match        https://www.reddit.com/*
@@ -26,6 +26,14 @@
     const SETTINGS = {
         discontinuedHosts: ["gfycat.com", "vid.me"],
         checkedHosts: ["streamable.com", "redgifs.com", "imgur.com", "giphy.com", "tenor.com"],
+        hideMediaRedirectsToHomepage: true,
+        homepagePathsByHost: {
+            "streamable.com": ["/"],
+            "redgifs.com": ["/"],
+            "imgur.com": ["/"],
+            "giphy.com": ["/"],
+            "tenor.com": ["/"],
+        },
         maximumConcurrentRequests: 2,
         requestTimeoutMilliseconds: 12_000,
         checkAheadDistance: "900px",
@@ -158,11 +166,6 @@
         )?.[1]?.trim() || "";
     }
 
-    function isSuccessfulVideoResponse(response) {
-        return response?.status >= 200 && response.status < 300 &&
-            /^video\//i.test(getResponseContentType(response));
-    }
-
     function requestMediaPage(url) {
         return new Promise(resolve => {
             let requestHandle;
@@ -179,7 +182,7 @@
                 anonymous: true,
                 timeout: SETTINGS.requestTimeoutMilliseconds,
                 onreadystatechange(response) {
-                    if (response.readyState !== 2) return;
+                    if (response.readyState < 2) return;
                     if (/^(?:video|image|audio)\//i.test(getResponseContentType(response))) {
                         finishRequest({
                             status: response.status,
@@ -197,6 +200,26 @@
         });
     }
 
+    function getHomepageRedirectReason(response, requestedURL) {
+        if (!SETTINGS.hideMediaRedirectsToHomepage ||
+            !isSupportedMediaURL(requestedURL) ||
+            response.status < 200 || response.status >= 300 ||
+            !/^(?:text\/html|application\/xhtml\+xml)(?:;|$)/i.test(getResponseContentType(response))) {
+            return null;
+        }
+        const finalURL = parseWebURL(response.finalUrl);
+        if (!finalURL) return null;
+        for (const [host, homepagePaths] of Object.entries(SETTINGS.homepagePathsByHost)) {
+            if (hostnameMatches(requestedURL.hostname, host) &&
+                hostnameMatches(finalURL.hostname, host) &&
+                !homepagePaths.includes(requestedURL.pathname) &&
+                homepagePaths.includes(finalURL.pathname)) {
+                return `Media redirected to ${host} homepage (possible soft 404 or access restriction)`;
+            }
+        }
+        return null;
+    }
+
     function getMissingMediaReason(response, url) {
         if (!response) return null;
         const finalURL = parseWebURL(response.finalUrl);
@@ -206,6 +229,8 @@
             return "Imgur redirected to its removed-media placeholder";
         }
         if ([404, 410].includes(response.status)) return `HTTP ${response.status}`;
+        const homepageReason = getHomepageRedirectReason(response, url);
+        if (homepageReason) return homepageReason;
         if (response.status !== 200) return null;
         const responseHTML = response.responseText || "";
         if (!responseHTML || responseHTML.length > 2_000_000) return null;
@@ -214,10 +239,6 @@
             page.title,
             ...Array.from(page.querySelectorAll("h1, h2"), heading => heading.textContent),
         ].join(" ").replace(/\s+/g, " ").trim();
-        if (hostnameMatches(url.hostname, "imgur.com") &&
-            /\b(?:the requested page could not be found|the image you are requesting does not exist or is no longer available)\b/i.test(prominentText)) {
-            return "Imgur reports missing media";
-        }
         if (hostnameMatches(url.hostname, "streamable.com") &&
             /\b(?:this video (?:has been (?:removed|deleted)|is no longer available)|video (?:not found|has been removed|has been deleted))\b/i.test(prominentText)) {
             return "Streamable reports missing video";
@@ -229,36 +250,6 @@
         return null;
     }
 
-    async function checkPostMedia(url) {
-        const imgurGifv = hostnameMatches(url.hostname, "imgur.com") &&
-            /^\/[a-z0-9]+\.gifv$/i.test(url.pathname);
-        if (!imgurGifv) {
-            const response = await requestMediaPage(url.href);
-            return getMissingMediaReason(response, url);
-        }
-        const directVideoURL = new URL(url.href);
-        directVideoURL.hostname = "i.imgur.com";
-        directVideoURL.pathname = directVideoURL.pathname.replace(/\.gifv$/i, ".mp4");
-        const directResponse = await requestMediaPage(directVideoURL.href);
-        if (isSuccessfulVideoResponse(directResponse)) return null;
-        const directReason = getMissingMediaReason(directResponse, directVideoURL);
-        const originalResponse = await requestMediaPage(url.href);
-        if (isSuccessfulVideoResponse(originalResponse)) return null;
-        const originalReason = getMissingMediaReason(originalResponse, url);
-        const reason = originalReason || directReason;
-        console.debug(LOG_PREFIX, "Imgur availability check", {
-            originalURL: url.href,
-            directURL: directVideoURL.href,
-            directStatus: directResponse?.status,
-            directFinalURL: directResponse?.finalUrl,
-            directContentType: getResponseContentType(directResponse),
-            originalStatus: originalResponse?.status,
-            originalFinalURL: originalResponse?.finalUrl,
-            reason,
-        });
-        return reason;
-    }
-
     async function checkMediaAvailability(url) {
         const cacheKey = url.href;
         const cachedResult = cachedResults.get(cacheKey);
@@ -267,7 +258,8 @@
         }
         if (pendingRequests.has(cacheKey)) return pendingRequests.get(cacheKey);
         const request = (async () => {
-            const reason = await checkPostMedia(url);
+            const response = await requestMediaPage(cacheKey);
+            const reason = getMissingMediaReason(response, url);
             cachedResults.set(cacheKey, { checkedAt: Date.now(), reason });
             return reason;
         })();
